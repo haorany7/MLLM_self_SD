@@ -9,124 +9,214 @@ from fastchat.utils import str_to_torch_dtype
 
 from evaluation_llama.eval import run_eval
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 from bayes_opt import BayesianOptimization, UtilityFunction
 
 from model.swift.utils import *
-from model.swift.modeling_llama import LlamaForCausalLM
+from model.swift.modeling_llava import LlavaForConditionalGeneration
 from model.swift.kv_cache import initialize_past_key_values
 
-def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
+def initialize_model_and_processor(model_path):
+    model = LlavaForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map={"": "cuda:0"},
+    )
+    processor = AutoProcessor.from_pretrained(model_path)
+    
+    # Set processor configuration
+    processor.patch_size = model.config.vision_config.patch_size
+    processor.vision_feature_select_strategy = "default"
+    
+    return model, processor
+
+def swift_forward(input_ids, model, processor, max_new_tokens, image=None, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
-    assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
-    # Avoid modifying the input_ids in-place
-    input_ids = input_ids.clone()
-    accept_length_list = []
+    try:
+        print("swift_forward processing begins")
 
-    # Initialize the past key and value states
-    (
-        past_key_values,
-        past_key_values_data,
-        current_length_data,
-    ) = initialize_past_key_values(model.model)
-    model.past_key_values = past_key_values
-    model.past_key_values_data = past_key_values_data
-    model.current_length_data = current_length_data
+        # Ensure all inputs are on the same device as the model
+        device = model.device
+        inputs = {
+            'input_ids': input_ids['input_ids'].to(device),
+            'attention_mask': input_ids['attention_mask'].to(device),
+            'pixel_values': input_ids['pixel_values'].to(device) if 'pixel_values' in input_ids else torch.zeros(
+                (1, 3, model.config.vision_config.image_size, model.config.vision_config.image_size),
+                dtype=torch.float16,
+                device=device
+            )
+        }
 
-    input_len = input_ids.shape[1]
-    cur_length = input_len
-    reset_swift_mode(model)
-    swift_logits, sample_token, top1_prob = initialize_swift(input_ids, model, max_new_tokens,
-                                                             past_key_values, past_key_values_data,
-                                                             current_length_data, logits_processor=logits_processor)
+        # Debugging: Print input shapes and devices
+        for key, value in inputs.items():
+            if isinstance(value, torch.Tensor):
+                print(f"{key} shape: {value.shape}, device: {value.device}")
 
-    # Clone the prefilled past key and value states for swift optimization
-    input_past_key_values_data = []
-    for i in range(len(past_key_values_data)):
-        input_past_key_values_data.append(past_key_values_data[i].clone())
-    input_current_length_data = current_length_data.clone()
+        # Use pdb to start debugging
+        input_len = inputs['input_ids'].shape[1]
+        cur_length = input_len
+        accept_length_list = []
+        
+        # Access the correct model component for layers
+        if hasattr(model, 'language_model'):
+            base_model = model.language_model
+        elif hasattr(model, 'model'):
+            base_model = model.model
+        else:
+            raise AttributeError("Cannot find the language model in LlavaForConditionalGeneration")
 
-    new_token_num = 0
-    draft_token_num = 0
-    total_acc_num = 0
-    for idx in range(max_steps):
-        # drafted tokens + 1 bonus verified token
-        draft_token_num += len(top1_prob)
-        # Initialize the swift buffer
-        swift_choices = eval(f"{get_choices_list(top1_prob, logits_processor=logits_processor)}")
-        swift_buffers = generate_swift_buffers(swift_choices, device=model.model.layers[-1].self_attn.q_proj.weight.device)
-        model.swift_buffers = swift_buffers
-        model.swift_choices = swift_choices
-        model.model.swift_mask = swift_buffers["swift_attn_mask"]
+        # Initialize past key values
+        past_key_values, past_key_values_data, current_length_data = initialize_past_key_values(base_model)
 
-        candidates, cart_candidates_prob, tree_candidates = generate_candidates(
-            swift_logits,
-            swift_buffers["tree_indices"],
-            swift_buffers["retrieve_indices"],
-            sample_token,
-            logits_processor
+        # Set the past key values
+        base_model.past_key_values = past_key_values
+        base_model.past_key_values_data = past_key_values_data
+        base_model.current_length_data = current_length_data
+
+        reset_swift_mode(base_model)
+        
+        # Initialize swift
+        swift_logits, sample_token, top1_prob = initialize_swift(
+            input_ids=inputs,
+            model=model,
+            max_new_tokens=max_new_tokens,
+            past_key_values=past_key_values,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            logits_processor=logits_processor
         )
+        #print sample_token
+        print(f"sample_token shape: {sample_token.shape}")
+        print(f"sample_token content: {sample_token}")
+        #decode sample_token
+        print(f"sample_token decoded: {processor.tokenizer.decode(sample_token[0], skip_special_tokens=True)}")
+        # Clone past key values data for optimization
+        input_past_key_values_data = [pkv.clone() for pkv in past_key_values_data]
+        input_current_length_data = current_length_data.clone()
 
-        logits, outputs = tree_decoding(
-            model,
-            tree_candidates,
-            past_key_values,
-            swift_buffers["swift_position_ids"],
-            input_ids,
-            swift_buffers["retrieve_indices"],
-        )
+        new_token_num = 0
+        draft_token_num = 0
+        total_acc_num = 0
+        
+        inputs=input_ids['input_ids']
+        for idx in range(max_steps):
+            draft_token_num += len(top1_prob)
+            
+            # Initialize swift buffers
+            swift_choices = eval(f"{get_choices_list(top1_prob, logits_processor=logits_processor)}")
+            swift_buffers = generate_swift_buffers(
+                swift_choices, 
+                device=base_model.model.layers[-1].self_attn.q_proj.weight.device
+            )
+            
+            # Set swift attributes on base_model
+            base_model.swift_buffers = swift_buffers
+            base_model.swift_choices = swift_choices
+            base_model.swift_mask = swift_buffers["swift_attn_mask"]
 
-        best_candidate, accept_length, sample_p = evaluate_posterior(
+            import pdb; pdb.set_trace()
+            # Generate and evaluate candidates
+            candidates, cart_candidates_prob, tree_candidates = generate_candidates(
+                swift_logits,
+                swift_buffers["tree_indices"],
+                swift_buffers["retrieve_indices"],
+                sample_token,
+                logits_processor
+            )
+            #print tree_candidates
+            print(f"tree_candidates shape: {tree_candidates.shape}")
+            print(f"tree_candidates content: {tree_candidates}")
+            #decode tree_candidates
+            print(f"tree_candidates decoded: {processor.tokenizer.decode(tree_candidates[0], skip_special_tokens=True)}")
+            # # Print debug info about tree candidates
+            # print(f"type of tree_candidates: {type(tree_candidates)}")
+            # print(f"candidate_sequences shape: {tree_candidates.shape}")
+            # print(f"candidate_sequences content: {tree_candidates}")
+            # print(f"candidate_sequences decoded: {processor.tokenizer.decode(tree_candidates[0], skip_special_tokens=True)}")
+
+            # # Handle image tokens
+            # image_token_id = model.config.image_token_index
+            # if (tree_candidates == image_token_id).sum() == 0:
+            #     orig_image_pos = (inputs['input_ids'] == image_token_id).nonzero()
+            #     if len(orig_image_pos) > 0:
+            #         image_pos = orig_image_pos[0][1].item()
+            #         new_tree_candidates = tree_candidates.clone()
+            #         if image_pos < new_tree_candidates.shape[1]:
+            #             new_tree_candidates[:, image_pos] = image_token_id
+            #         tree_candidates = new_tree_candidates
+
+            # Tree decoding
+            logits, outputs = tree_decoding(
+                model,
+                tree_candidates=tree_candidates,
+                past_key_values=past_key_values,
+                swift_position_ids=swift_buffers["swift_position_ids"],
+                input_ids=inputs,
+                retrieve_indices=swift_buffers["retrieve_indices"],
+            )
+
+            # Evaluate and update
+            best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor, cart_candidates_prob, swift_logits[2],
                 swift_buffers["p_indices"], tree_candidates, swift_buffers["b_indices"]
             )
 
-        input_ids, new_token_num, sample_token = update_inference_inputs(
-            input_ids,
-            candidates,
-            best_candidate,
-            accept_length,
-            swift_buffers["retrieve_indices"],
-            logits_processor,
-            new_token_num,
-            past_key_values_data,
-            current_length_data,
-            sample_p
-        )
+            inputs, new_token_num, sample_token = update_inference_inputs(
+                input_ids=inputs,
+                candidates=candidates,
+                best_candidate=best_candidate,
+                accept_length=accept_length,
+                retrieve_indices=swift_buffers["retrieve_indices"],
+                new_token_num=new_token_num,
+                past_key_values_data_list=past_key_values_data,
+                current_length_data=current_length_data,
+                logits_processor=logits_processor,
+                sample_p=sample_p
+            )
 
-        # layer set optimization
-        if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
-                and idx % statistics["opt_interval"] == 0):
-            swift_optimization(
-                model,
-                input_ids[:, input_len:],
-                input_past_key_values_data,
-                input_current_length_data,
-                new_token_num,
-                statistics,
-                optimizer=optimizer,
-                utility=utility)
+            # Optimization if needed
+            if (new_token_num > (statistics["context_window"] + 1) and 
+                statistics["optimization"] and 
+                idx % statistics["opt_interval"] == 0):
+                swift_optimization(
+                    model,
+                    inputs[:, input_len:],
+                    input_past_key_values_data,
+                    input_current_length_data,
+                    new_token_num,
+                    statistics,
+                    optimizer=optimizer,
+                    utility=utility
+                )
 
-        # swift drafting
-        swift_logits, top1_prob = swift_draft(
-            model,
-            input_ids=sample_token,
-            new_token_num=new_token_num,
-            past_key_values_data=past_key_values_data,
-            current_length_data=current_length_data,
-            max_new_tokens=max_new_tokens,
-            logits_processor=logits_processor,
-        )
-        accept_length_tree = input_ids.shape[1] - cur_length
-        cur_length = accept_length_tree + cur_length
-        accept_length_list.append(accept_length_tree)
-        total_acc_num += accept_length_tree - 1
-        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-            break
-        if new_token_num > max_new_tokens:
-            break
-    logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
-    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
+            # Draft next tokens
+            swift_logits, top1_prob = swift_draft(
+                model=model,
+                input_ids=sample_token,
+                new_token_num=new_token_num,
+                past_key_values_data=past_key_values_data,
+                current_length_data=current_length_data,
+                max_new_tokens=max_new_tokens,
+                logits_processor=logits_processor,
+            )
+
+            # Update lengths and check stopping conditions
+            accept_length_tree = inputs.shape[1] - cur_length
+            cur_length = accept_length_tree + cur_length
+            accept_length_list.append(accept_length_tree)
+            total_acc_num += accept_length_tree - 1
+
+            if processor.tokenizer.eos_token_id in inputs[0, input_len:].tolist():
+                break
+            if new_token_num > max_new_tokens:
+                break
+
+        logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
+        return inputs, new_token_num, idx + 1, accept_length_list, draft_token_num
+        
+    except Exception as e:
+        print(f"Error in swift_forward: {str(e)}")
+        raise e
 
 
 if __name__ == "__main__":
@@ -263,13 +353,16 @@ if __name__ == "__main__":
 
     torch.nn.Linear.reset_parameters = lambda x: None
 
-    model = LlamaForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=str_to_torch_dtype(args.dtype),
-        low_cpu_mem_usage=True,
-        device_map="auto")
+    # model = LlamaForCausalLM.from_pretrained(
+    #     args.model_path,
+    #     torch_dtype=str_to_torch_dtype(args.dtype),
+    #     low_cpu_mem_usage=True,
+    #     device_map="auto")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    # tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model, processor = initialize_model_and_processor(args.model_path)
+    num_hidden_layers = model.config.text_config.num_hidden_layers
+    print(f"Number of hidden layers in Llama config: {num_hidden_layers}")
 
     if args.temperature > 1e-5:
         logits_processor = prepare_logits_processor(temperature=args.temperature, top_p=args.top_p)
@@ -283,13 +376,13 @@ if __name__ == "__main__":
                                                                                   task_name=args.task_name)
     else:
         # Unified layer set initialization
-        _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)  # keep the first and last layer
-        _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
+        _attn_skip_layer_id_set = np.arange(1, num_hidden_layers - 1, 2)  # keep the first and last layer
+        _mlp_skip_layer_id_set = np.arange(1, num_hidden_layers - 1, 2)
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
     # Bayes Optimization Settings
-    pbounds = {f"x{i}": (0, 1) for i in range((model.config.num_hidden_layers - 2) * 2)} # keep the first and last layer
+    pbounds = {f"x{i}": (0, 1) for i in range((num_hidden_layers - 2) * 2)} # keep the first and last layer
     optimizer = BayesianOptimization(f=None, pbounds=pbounds, random_state=1, verbose=1, allow_duplicate_points=True)
     optimizer.set_gp_params(alpha=1e-2)
     utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
@@ -302,7 +395,7 @@ if __name__ == "__main__":
 
     run_eval(
         model=model,
-        tokenizer=tokenizer,
+        processor=processor,
         forward_func=swift_forward,
         model_id=args.model_id,
         answer_file=answer_file,

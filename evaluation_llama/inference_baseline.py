@@ -9,25 +9,94 @@ from fastchat.utils import str_to_torch_dtype
 from evaluation_llama.eval import run_eval
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 
-def baseline_forward(input_ids, model, tokenizer, max_new_tokens, temperature=0.0, top_p=0.85, do_sample=False):
-    attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=model.device)
-    output_ids = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.eos_token_id,
+from transformers import LlavaProcessor, AutoProcessor
+from model.swift.modeling_llava import LlavaForConditionalGeneration
+
+import torch
+import logging
+import time
+from typing import Dict, Any, Tuple, List
+from PIL import Image
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def initialize_model_and_processor(model_path):
+    model = LlavaForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
     )
-    new_token = len(output_ids[0][len(input_ids[0]):])
-    step = new_token
-    draft_token_num = new_token
-    accept_length_list = [1] * new_token
-    return output_ids, new_token, step, accept_length_list, draft_token_num
+    processor = AutoProcessor.from_pretrained(model_path)
+    processor.patch_size = model.config.vision_config.patch_size
+    processor.vision_feature_select_strategy = "default"
+    return model, processor
 
+def baseline_forward(
+    input_ids: Dict[str, torch.Tensor],
+    model: Any,
+    processor: Any,
+    image: Any = None,
+    max_new_tokens: int = 512,
+    temperature: float = 0.0,
+    top_p: float = 0.85,
+    do_sample: bool = False,
+    **kwargs
+) -> Tuple[torch.Tensor, int, int, List[int], int]:
+    try:
+        # 1. Convert BatchFeature to dict and verify image token
+        if hasattr(input_ids, 'to_dict'):
+            input_ids = dict(input_ids)
+        
+        print("-----------------------------------------")
+        print("baseline_forward")
+        # print(f"Input IDs: {input_ids}")
+        
+        # 5. Generate with verified inputs
+        output_ids = model.generate(
+            **input_ids,
+            max_new_tokens=max_new_tokens,
+            # do_sample=do_sample,
+            # temperature=temperature,
+            # top_p=top_p,
+            pad_token_id=processor.tokenizer.eos_token_id,
+            #eos_token_id=processor.tokenizer.eos_token_id,
+        )
+        
+        # 6. Output Processing
+        try:
+            new_token = len(output_ids[0]) - len(input_ids['input_ids'][0])
+            step = new_token
+            draft_token_num = new_token
+            accept_length_list = [1] * new_token
+        except Exception as e:
+            logger.error("Error in output processing:")
+            logger.error(str(e))
+            raise
+
+        return output_ids, new_token, step, accept_length_list, draft_token_num
+
+    except Exception as e:
+        logger.error("\n=== Error Details ===")
+        logger.error(f"Error location: {e.__traceback__.tb_frame.f_code.co_name}")
+        logger.error(f"Line number: {e.__traceback__.tb_lineno}")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        
+        # Print minimal but relevant state
+        logger.error("\nCritical State:")
+        if isinstance(input_ids, dict):
+            logger.error("Input shapes:")
+            logger.info(f"Input shapes: {[(k, v.shape) for k, v in input_ids.items() if isinstance(v, torch.Tensor)]}")
+            logger.info(f"Input content: {input_ids}")
+        
+        if image is not None:
+            logger.error(f"Image size: {getattr(image, 'size', 'No size available')}")
+        
+        raise
+   
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -98,23 +167,41 @@ if __name__ == "__main__":
 
     print(f"Output to {answer_file}")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=str_to_torch_dtype(args.dtype),
-        low_cpu_mem_usage=True,
-        device_map="auto"
-    )
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     args.model_path,
+    #     torch_dtype=str_to_torch_dtype(args.dtype),
+    #     low_cpu_mem_usage=True,
+    #     device_map="auto"
+    # )
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
+
+    model, processor = initialize_model_and_processor(args.model_path)
+
+
+    
     if args.temperature > 0:
         do_sample = True
     else:
         do_sample = False
+        
+    # # After loading the processor and model
+    # tokenizer = processor.tokenizer
 
+    # # Check if '<|image|>' is a special token; if not, add it
+    # if '<|image|>' not in tokenizer.additional_special_tokens:
+    #     tokenizer.add_special_tokens({'additional_special_tokens': ['<|image|>']})
+    #     # Resize the model embeddings to accommodate the new special token
+    #     model.resize_token_embeddings(len(tokenizer))
+        
+    # # Add this after loading the processor
+    # if '<|image|>' not in processor.tokenizer.special_tokens_map.values():
+    #     processor.tokenizer.add_special_tokens({'additional_special_tokens': ['<|image|>']})
+    #     model.resize_token_embeddings(len(processor.tokenizer))
+        
     run_eval(
         model=model,
-        tokenizer=tokenizer,
+        processor=processor,  # Use processor instead of tokenizer
         forward_func=baseline_forward,
         model_id=args.model_id,
         answer_file=answer_file,

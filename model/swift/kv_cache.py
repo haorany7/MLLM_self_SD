@@ -66,6 +66,18 @@ class KVCache:
         dst.copy_(tensor)
         self.current_length.add_(tensor.shape[dim])
         return torch.narrow(self.data, 2, 0, self.current_length)
+    def __len__(self):
+        # Return the current length of the cache in terms of the sequence length
+        return self.current_length.item()
+
+    def get_seq_length(self):
+        # Return the sequence length of the cache
+        return self.current_length.item()
+
+    def __getitem__(self, idx):
+        # Index into the cache to retrieve specific elements (keys and values)
+        return self.data[idx]
+
 
 
 def initialize_past_key_values(model):
@@ -213,3 +225,14 @@ def clone_past_key_values(model, past_key_values_data_list, current_length_data)
             )
         bias += 1
     return past_key_values
+
+def convert_to_native_format(past_key_values):
+    """Convert KVCache objects to native tensor tuples format."""
+    if isinstance(past_key_values[0][0], torch.Tensor):
+        # Already in native format, return as is
+        return past_key_values
+    return tuple(
+        (layer[0].data[:, :, :layer[0].current_length.item()],
+         layer[1].data[:, :, :layer[1].current_length.item()])
+        for layer in past_key_values
+    )

@@ -5,7 +5,7 @@ import json
 import logging
 import torch
 import numpy as np
-from .kv_cache import clone_past_key_values
+from .kv_cache import clone_past_key_values, convert_to_native_format
 TOPK = 10  # topk for sparse tree
 
 from transformers.generation.logits_process import (
@@ -337,33 +337,63 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
 
 
 def swift_verify(
-        model,
-        input_ids=None,
-        past_key_values=None,
-        position_ids=None,
+    model,
+    input_ids=None,
+    past_key_values=None,
+    position_ids=None,
 ):
     """
     Verify the swift structure using the provided model and input.
 
     Args:
-    - input_ids (torch.Tensor): The input tensor containing token ids.
-    - model (LLM): The model containing the full LLM model.
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
-    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
+    - model: The LLaVA model
+    - input_ids (dict or torch.Tensor): If dict-like, should contain 'input_ids', 'attention_mask', 'pixel_values' keys.
+    - past_key_values (list): Contains past hidden states and attention values
+    - position_ids (torch.Tensor): Positional IDs for the swift structure
 
     Returns:
-    - outputs (tuple): Contains the outputs from the model.
-    - orig (torch.Tensor): Original logits from the full model.
+    - outputs: Outputs from the model
+    - orig: Original logits from the full model
     """
     with torch.inference_mode():
-        # Pass input through the base model
-        outputs = model.model(
+        if isinstance(input_ids, torch.Tensor):
+            # `input_ids` is a tensor; set defaults
+            attention_mask = None
+            pixel_values = None
+        elif hasattr(input_ids, '__getitem__') and hasattr(input_ids, 'keys'):
+            # `input_ids` is dict-like (e.g., dict, BatchFeature)
+            input_ids_tensor = input_ids['input_ids']
+            attention_mask = input_ids.get('attention_mask', None)
+            pixel_values = input_ids.get('pixel_values', None)
+            input_ids = input_ids_tensor
+        else:
+            raise TypeError(f"Unsupported input type: {type(input_ids)}")
+
+        if past_key_values is not None and hasattr(model, 'language_model'):
+            past_key_values = convert_to_native_format(past_key_values)
+
+        if past_key_values is None:
+            # Initial pass: Use `pixel_values` and `attention_mask` from inputs
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+            # `pixel_values` should be provided in the initial pass
+            if pixel_values is None:
+                raise ValueError("`pixel_values` must be provided for the initial pass.")
+        else:
+            # Subsequent passes: Do not use `pixel_values`, set `attention_mask` to ones
+            pixel_values = None
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+
+        # Perform the forward pass
+        outputs = model(
             input_ids=input_ids,
-            attention_mask=None,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=position_ids,
+            use_cache=True,
+            pixel_values=pixel_values,  # This should be None in successive passes
         )
-        orig = model.lm_head(outputs[0])
+        orig = outputs.logits
 
     return outputs, orig
 
@@ -401,6 +431,15 @@ def sample(logits, logits_processor, k=1):
 
     return sampled_indices, sampled_probs, probabilities
 
+from contextlib import contextmanager
+
+@contextmanager
+def draft_mode():
+    """Context manager for draft mode - empty for now but can be extended later"""
+    try:
+        yield
+    finally:
+        pass
 
 @torch.no_grad()
 def swift_draft(
@@ -438,19 +477,31 @@ def swift_draft(
     for i in range(len(past_key_values_data)):
         draft_past_key_values_data.append(past_key_values_data[i].clone())
     draft_current_length_data = current_length_data.clone()
-    draft_past_key_values = clone_past_key_values(model, draft_past_key_values_data, draft_current_length_data)
+    draft_past_key_values = clone_past_key_values(model.language_model, draft_past_key_values_data, draft_current_length_data)
+
+    # Convert to native format if using LLAVA
+    if hasattr(model, 'language_model'):
+        draft_past_key_values = convert_to_native_format(draft_past_key_values)
 
     ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
+    
+    # Get initial pixel values and input ids
+    #pixel_values = input_ids['pixel_values']
+    #current_input_ids = input_ids['input_ids']
+    current_input_ids = input_ids
+    attention_mask = torch.ones_like(current_input_ids) if current_input_ids.shape[1] == 1 else None
     with torch.inference_mode():
         for step_draft in range(max_step_draft):
-            with model.self_draft():
-                draft_outputs = model.model(
-                    input_ids=input_ids,
-                    attention_mask=None,
+            
+            with draft_mode():
+                draft_outputs = model(
+                    input_ids=current_input_ids,
+                    #pixel_values=pixel_values,
+                    attention_mask=attention_mask,  # Add attention mask
                     past_key_values=draft_past_key_values,
                     position_ids=position_ids,
                 )
-            current_draft_logits = model.lm_head(draft_outputs[0])
+                current_draft_logits = draft_outputs.logits[:, -1:, :]
             if logits_processor is not None:
                 topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
                 input_ids = topk_index[:, 0].unsqueeze(0)
