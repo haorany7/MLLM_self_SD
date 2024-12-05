@@ -27,19 +27,21 @@ def test_swift_forward(model, processor):
     """Test swift_forward with basic image input"""
     try:
         # 1. Basic setup
-        url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        #url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         image = Image.open(requests.get(url, stream=True).raw)
-        prompt = "USER: What do you see in this image? <image>\nASSISTANT:"
+        prompt = "USER: How many cars can you see in this image? <image>\nASSISTANT:"
         
         # 2. Process inputs
         inputs = processor(images=image, text=prompt, return_tensors="pt").to(model.device)
-        
+        #print decoded prompt
+        print(f"Decoded input prompt in test_swift_forward: '{processor.tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=False)}'")
         # 3. Setup statistics dict
         statistics = {
             "context_window": 32,
             "optimization": True,
             "opt_interval": 1,
-            "skip_ratio": 0.45,
+            "skip_ratio": 0,
             "acceptance_rate_list": [],
             "bayes_interval": 25,
             "max_opt_iter": 1000,
@@ -87,7 +89,6 @@ def test_swift_forward(model, processor):
 def test_swift_verify(model, processor):
     """Test swift_verify function with proper image handling"""
     print("\nTesting swift_verify with all scenarios:")
-    just 
     try:
         # 1. Initial pass with image
         print("\nScenario 1: Initial pass with image")
@@ -179,7 +180,7 @@ def test_swift_verify(model, processor):
         print(f"Error: {str(e)}")
         traceback.print_exc()
         return False
-def test_swift_verify_with_token_sequence(model, processor):
+def test_swift_verify_with_token_sequence(model, processor, iterations=5):
     """
     Test swift_verify function with a token sequence of shape [1, N] and past_key_values.
     """
@@ -188,7 +189,8 @@ def test_swift_verify_with_token_sequence(model, processor):
     try:
         # 1. Initial pass with image
         print("\nScenario 1: Initial pass with image")
-        url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        #url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         image = Image.open(requests.get(url, stream=True).raw)
         prompt = "USER: What do you see in this image? <image>\nASSISTANT:"
         
@@ -218,19 +220,25 @@ def test_swift_verify_with_token_sequence(model, processor):
         generated_tokens = []
         current_output = outputs1
         
-        for _ in range(5):  # Generate 5 tokens as an example
-            next_token = current_output.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
-            generated_tokens.append(next_token.item())
+        for i in range(iterations):  # Loop for the specified number of iterations
+            next_token_id = current_output.logits[0, -1].argmax().item()
+            next_token = torch.tensor([[next_token_id]], dtype=torch.long, device=model.device)  # Ensure it's a tensor
+            generated_tokens.append(next_token_id)
             current_output, _ = swift_verify(
                 model=model,
                 input_ids=next_token,
                 past_key_values=current_output.past_key_values,
                 position_ids=None
             )
+            
+            # Print the result after each iteration
+            token_sequence = torch.tensor(generated_tokens, dtype=torch.long, device=model.device).unsqueeze(0)
+            print(f"Iteration {i+1}:")
+            print(f"Generated tokens: {processor.tokenizer.decode(token_sequence[0], skip_special_tokens=True)}")
         
         # Combine the tokens into a sequence of shape [1, N]
         token_sequence = torch.tensor(generated_tokens, dtype=torch.long, device=model.device).unsqueeze(0)
-        print(f"Input sequence: {processor.decode(token_sequence[0], skip_special_tokens=True)}")
+        print(f"Final input sequence: {processor.tokenizer.decode(token_sequence[0], skip_special_tokens=True)}")
 
         # Pass the sequence to swift_verify
         outputs2, logits2 = swift_verify(
@@ -242,12 +250,12 @@ def test_swift_verify_with_token_sequence(model, processor):
 
         # Get next token prediction
         next_token = outputs2.logits[0, -1].argmax().item()  # Only get prediction for the last position
-        print(f"Next predicted token: {processor.decode([next_token], skip_special_tokens=True)}")
+        print(f"Next predicted token: {processor.tokenizer.decode([next_token], skip_special_tokens=True)}")
 
         # 3. Print results
         print("\nResults:")
-        initial_text = processor.decode(inputs['input_ids'][0])
-        generated_text = processor.decode(generated_tokens)
+        initial_text = processor.tokenizer.decode(inputs['input_ids'][0])
+        generated_text = processor.tokenizer.decode(generated_tokens)
         print(f"Initial prompt: {initial_text}")
         print(f"Generated text from sequence: {generated_text}")
         
@@ -259,6 +267,37 @@ def test_swift_verify_with_token_sequence(model, processor):
         print(f"Error: {str(e)}")
         traceback.print_exc()
         return False
+def test_standard_generation(model, processor):
+    try:
+        # Load image
+        #url = "https://www.ilankelman.org/stopsigns/australia.jpg"
+        url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+        image = Image.open(requests.get(url, stream=True).raw).convert('RGB')
+        
+        # Prepare prompt
+        prompt = "USER: How many cars can you see in this image? <image>\nASSISTANT:"
+        
+        # Process inputs
+        inputs = processor(images=image, text=prompt, return_tensors="pt").to(model.device)
+        print(f"Decoded input prompt in test_standard_generation: '{processor.tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=False)}'")
+        # Generate output
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                pixel_values=inputs['pixel_values'],
+                max_new_tokens=50,
+                do_sample=False,  # Disable sampling for deterministic output
+            )
+        
+        # Decode output
+        generated_text = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print("Standard Generation Output:")
+        print(generated_text)
+        
+    except Exception as e:
+        print(f"Error during standard generation: {str(e)}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
@@ -300,6 +339,7 @@ if __name__ == "__main__":
     # buffers = test_swift_buffer_generation(model, processor)
     # test_tree_decoding(model, processor)
     #test_swift_verify(model, processor)
+    test_standard_generation(model, processor)
     test_swift_verify_with_token_sequence(model, processor)
     test_swift_forward(model, processor)
     #test_successive_forward(model, processor)

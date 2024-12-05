@@ -14,6 +14,7 @@ from bayes_opt import BayesianOptimization, UtilityFunction
 
 from model.swift.utils import *
 from model.swift.modeling_llava import LlavaForConditionalGeneration
+#from transformers import LlavaForConditionalGeneration
 from model.swift.kv_cache import initialize_past_key_values
 
 def initialize_model_and_processor(model_path):
@@ -34,6 +35,7 @@ def swift_forward(input_ids, model, processor, max_new_tokens, image=None, stati
                   logits_processor=None, max_steps=512):
     try:
         print("swift_forward processing begins")
+        model.past_key_values = None
 
         # Ensure all inputs are on the same device as the model
         device = model.device
@@ -46,7 +48,9 @@ def swift_forward(input_ids, model, processor, max_new_tokens, image=None, stati
                 device=device
             )
         }
-
+        decoded_prompt = processor.tokenizer.decode(input_ids['input_ids'][0], skip_special_tokens=False)
+        print(f"Decoded input prompt in swift_forward: '{decoded_prompt}'")
+         # Rest of the code...
         # Debugging: Print input shapes and devices
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
@@ -69,9 +73,9 @@ def swift_forward(input_ids, model, processor, max_new_tokens, image=None, stati
         past_key_values, past_key_values_data, current_length_data = initialize_past_key_values(base_model)
 
         # Set the past key values
-        base_model.past_key_values = past_key_values
-        base_model.past_key_values_data = past_key_values_data
-        base_model.current_length_data = current_length_data
+        model.past_key_values = past_key_values
+        model.past_key_values_data = past_key_values_data
+        model.current_length_data = current_length_data
 
         reset_swift_mode(base_model)
         
@@ -114,7 +118,7 @@ def swift_forward(input_ids, model, processor, max_new_tokens, image=None, stati
             base_model.swift_choices = swift_choices
             base_model.swift_mask = swift_buffers["swift_attn_mask"]
 
-            import pdb; pdb.set_trace()
+            #import pdb; pdb.set_trace()
             # Generate and evaluate candidates
             candidates, cart_candidates_prob, tree_candidates = generate_candidates(
                 swift_logits,
@@ -217,6 +221,37 @@ def swift_forward(input_ids, model, processor, max_new_tokens, image=None, stati
     except Exception as e:
         print(f"Error in swift_forward: {str(e)}")
         raise e
+# def swift_forward(input_ids, model, processor, max_new_tokens, **kwargs):
+#     try:
+#         print("swift_forward processing begins")
+
+#         # Prepare inputs
+#         inputs = {
+#             'input_ids': input_ids['input_ids'],
+#             'attention_mask': input_ids['attention_mask'],
+#             'pixel_values': input_ids['pixel_values'],
+#         }
+        
+#         # Generate output using standard generate method
+#         with torch.no_grad():
+#             outputs = model.generate(
+#                 input_ids=inputs['input_ids'],
+#                 attention_mask=inputs['attention_mask'],
+#                 pixel_values=inputs['pixel_values'],
+#                 max_new_tokens=max_new_tokens,
+#                 do_sample=False,
+#             )
+        
+#         # Decode output
+#         generated_text = processor.tokenizer.decode(outputs[0], skip_special_tokens=True)
+#         print("Generated Text from swift_forward:")
+#         print(generated_text)
+        
+#         return outputs
+        
+#     except Exception as e:
+#         print(f"Error in swift_forward: {str(e)}")
+#         raise e
 
 
 if __name__ == "__main__":
@@ -376,8 +411,8 @@ if __name__ == "__main__":
                                                                                   task_name=args.task_name)
     else:
         # Unified layer set initialization
-        _attn_skip_layer_id_set = np.arange(1, num_hidden_layers - 1, 2)  # keep the first and last layer
-        _mlp_skip_layer_id_set = np.arange(1, num_hidden_layers - 1, 2)
+        _attn_skip_layer_id_set = [] #np.arange(1, num_hidden_layers - 1, 2)  # keep the first and last layer
+        _mlp_skip_layer_id_set = [] #np.arange(1, num_hidden_layers - 1, 2)
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
